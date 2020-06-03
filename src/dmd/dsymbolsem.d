@@ -5855,9 +5855,104 @@ private extern(C++) final class DsymbolSemanticVisitor : Visitor
     }
 }
 
+private struct TraceRecord
+{
+    Loc loc;
+    long timeSpentExclusive;
+    long timeSpentInclusive;
+    long timeSpent() { return timeSpentExclusive + timeSpentInclusive; }
+}
+
+private TraceRecord[] instanceList = null;
+private int instanceListDepth = 0;
+private long lastEvent = 0;
+
+private struct CallRecord
+{
+    Loc loc;
+    long timeSpent;
+    CallRecord[Loc] targets;
+}
+private CallRecord[Loc] records = null;
+
+void addTraceLink(TraceRecord from, TraceRecord to)
+{
+    records.require(from.loc, CallRecord(from.loc, 1));
+    records.require(to.loc, CallRecord(to.loc));
+    records[to.loc].timeSpent += to.timeSpentExclusive;
+    records[from.loc].targets.require(to.loc, CallRecord(to.loc));
+    records[from.loc].targets[to.loc].timeSpent += to.timeSpent;
+}
+
+private long now()
+{
+    import core.sys.posix.time : CLOCK_MONOTONIC, clock_gettime, timespec;
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return cast(long) ts.tv_nsec + ts.tv_sec * 1_000_000_000L;
+}
+
+private void addInstance(Loc loc)
+{
+    if (!instanceList) instanceList ~= TraceRecord(Loc("root", 0, 0)); // init to 1
+    const now = .now;
+    if (lastEvent == 0) lastEvent = now;
+    long timeBetween = now - lastEvent;
+    lastEvent = now;
+    instanceList[instanceListDepth].timeSpentExclusive += timeBetween;
+    instanceListDepth++;
+    if (instanceListDepth == instanceList.length)
+    {
+        instanceList ~= TraceRecord.init;
+    }
+    instanceList[instanceListDepth] = TraceRecord(loc);
+}
+
+private void clearInstance()
+{
+    const now = .now;
+    long timeBetween = now - lastEvent;
+    lastEvent = now;
+    instanceList[instanceListDepth].timeSpentExclusive += timeBetween;
+    instanceList[instanceListDepth - 1].timeSpentInclusive += instanceList[instanceListDepth].timeSpent;
+    addTraceLink(instanceList[instanceListDepth - 1], instanceList[instanceListDepth]);
+    instanceListDepth--;
+}
+
+static ~this()
+{
+    import std.stdio : File;
+
+    string res = "# callgrind format\n";
+    res ~= "events: Milliseconds\n";
+    res ~= "\n";
+    foreach (from; records)
+    {
+        import std.conv : to;
+        import std.format : format;
+
+        string fromFilename = from.loc.filename.to!string;
+        res ~= format!"fl=%s\n"(fromFilename);
+        res ~= format!"fn=file_%s_line_%s\n"(fromFilename, from.loc.linnum);
+        res ~= format!"%s %s\n"(from.loc.linnum, from.timeSpent / 1_000_000);
+        foreach (target; from.targets)
+        {
+            string toFilename = target.loc.filename.to!string;
+            res ~= format!"cfi=%s\n"(toFilename);
+            res ~= format!"cfn=file_%s_line_%s\n"(toFilename, target.loc.linnum);
+            res ~= format!"calls=1 %s\n"(target.loc.linnum);
+            res ~= format!"%s %s\n"(from.loc.linnum, target.timeSpent / 1_000_000);
+        }
+        res ~= "\n";
+    }
+    File("templates.cg", "wb").write(res);
+}
+
 void templateInstanceSemantic(TemplateInstance tempinst, Scope* sc, Expressions* fargs)
 {
-    //printf("[%s] TemplateInstance.dsymbolSemantic('%s', this=%p, gag = %d, sc = %p)\n", tempinst.loc.toChars(), tempinst.toChars(), tempinst, global.gag, sc);
+    addInstance(tempinst.loc);
+    scope(exit) clearInstance;
+    // printf("[%s] TemplateInstance.dsymbolSemantic('%s', this=%p, gag = %d, sc = %p)\n", tempinst.loc.toChars(), tempinst.toChars(), tempinst, global.gag, sc);
     version (none)
     {
         for (Dsymbol s = tempinst; s; s = s.parent)
